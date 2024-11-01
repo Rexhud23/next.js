@@ -35,6 +35,7 @@ import {
 } from '../app-render/encryption-utils'
 import DefaultCacheHandler from '../lib/cache-handlers/default'
 import type { CacheHandler, CacheEntry } from '../lib/cache-handlers/types'
+import type { CacheSignal } from '../app-render/cache-signal'
 
 const isEdgeRuntime = process.env.NEXT_RUNTIME === 'edge'
 
@@ -414,6 +415,23 @@ async function encodeFormData(formData: FormData): Promise<string> {
   return result
 }
 
+function createTrackedReadableStream(
+  stream: ReadableStream,
+  cacheSignal: CacheSignal
+) {
+  return new ReadableStream({
+    async pull(controller) {
+      const { done, value } = await stream.getReader().read()
+      if (done) {
+        controller.close()
+        cacheSignal.endRead()
+      } else {
+        controller.enqueue(value)
+      }
+    },
+  })
+}
+
 export function cache(kind: string, id: string, fn: any) {
   if (!process.env.__NEXT_DYNAMIC_IO) {
     throw new Error(
@@ -549,23 +567,7 @@ export function cache(kind: string, id: string, fn: any) {
           if (cacheSignal) {
             // When we have a cacheSignal we need to block on reading the cache
             // entry before ending the read.
-            const buffer: any[] = []
-            const reader = streamA.getReader()
-            for (let entry; !(entry = await reader.read()).done; ) {
-              buffer.push(entry.value)
-            }
-
-            let idx = 0
-            stream = new ReadableStream({
-              pull(controller) {
-                if (idx < buffer.length) {
-                  controller.enqueue(buffer[idx++])
-                } else {
-                  controller.close()
-                }
-              },
-            })
-            cacheSignal.endRead()
+            stream = createTrackedReadableStream(streamA, cacheSignal)
           } else {
             stream = streamA
           }
@@ -663,11 +665,26 @@ export function cache(kind: string, id: string, fn: any) {
           stream = newStream
         } else {
           propagateCacheLifeAndTags(workUnitStore, entry)
-          if (cacheSignal) {
+
+          // If we have a cache scope, we need to clone the entry and set it on
+          // the inner cache scope.
+          if (mutableResumeDataCache) {
+            const [entryLeft, entryRight] = cloneCacheEntry(entry)
+            if (cacheSignal) {
+              stream = createTrackedReadableStream(entryLeft.value, cacheSignal)
+            } else {
+              stream = entryLeft.value
+            }
+
+            mutableResumeDataCache.cache.set(
+              serializedCacheKey,
+              Promise.resolve(entryRight)
+            )
+          } else {
             // If we're not regenerating we need to signal that we've finished
             // putting the entry into the cache scope at this point. Otherwise we do
             // that inside generateCacheEntry.
-            cacheSignal.endRead()
+            cacheSignal?.endRead()
           }
 
           // We want to return this stream, even if it's stale.
@@ -707,17 +724,6 @@ export function cache(kind: string, id: string, fn: any) {
             workStore.pendingRevalidateWrites.push(promise)
 
             await ignoredStream.cancel()
-          }
-
-          // If we have a cache scope, we need to clone the entry and set it on
-          // the inner cache scope.
-          if (mutableResumeDataCache) {
-            const split = cloneCacheEntry(entry)
-            stream = split[0].value
-            mutableResumeDataCache.cache.set(
-              serializedCacheKey,
-              Promise.resolve(split[1])
-            )
           }
         }
       }
